@@ -1,0 +1,106 @@
+import subprocess as sp
+import re
+import requests
+import time
+import serial
+
+# Initialize serial port for TTL communication
+ser = serial.Serial('COM5', 9600)  # Replace 'COM3' with your actual serial port
+
+# Unique User-Agent for Nominatim API requests
+user_agent = 'SpeedLimit/1.0 (athul.preet@gmail.com)'
+
+def get_gps_data():
+    accuracy = 3  # Desired starting accuracy
+    pshellcomm = ['powershell']
+    pshellcomm.append('add-type -assemblyname system.device; '
+                      '$loc = new-object system.device.location.geocoordinatewatcher;'
+                      '$loc.start(); '
+                      'while(($loc.status -ne "Ready") -and ($loc.permission -ne "Denied")) '
+                      '{start-sleep -milliseconds 100}; '
+                      '$acc = %d; '
+                      'while($loc.position.location.horizontalaccuracy -gt $acc) '
+                      '{start-sleep -milliseconds 100; $acc = [math]::Round($acc*1.5)}; '
+                      '$loc.position.location.latitude; '
+                      '$loc.position.location.longitude; '
+                      '$loc.position.location.horizontalaccuracy; '
+                      '$loc.stop()' % (accuracy))
+    p = sp.Popen(pshellcomm, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+    (out, err) = p.communicate()
+    out = re.split('\n', out)
+    try:
+        lat = float(out[0])
+        lon = float(out[1])
+        return lat, lon
+    except ValueError:
+        print("Could not retrieve GPS data")
+        return None, None
+
+def reverse_geocode(lat, lon):
+    url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}"
+    headers = {'User-Agent': user_agent}
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data
+    except requests.exceptions.HTTPError as err:
+        print(f"HTTP Error: {err}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error: {e}")
+    except ValueError as json_err:
+        print(f"JSON Decode Error: {json_err}")
+    return None
+
+def get_speed_limit(osm_id):
+    overpass_url = "http://overpass-api.de/api/interpreter"
+    overpass_query = f"""
+    [out:json];
+    way({osm_id});
+    out body;
+    """
+    try:
+        response = requests.get(overpass_url, params={'data': overpass_query})
+        response.raise_for_status()
+        data = response.json()
+        for element in data['elements']:
+            if 'maxspeed' in element['tags']:
+                return int(element['tags']['maxspeed'])
+    except requests.exceptions.RequestException as e:
+        print(f"Error: {e}")
+    return None  # Return None if no speed limit found or error occurs
+
+def send_speed_limit_via_ttl(speed_limit):
+    if ser.isOpen() and speed_limit is not None:
+        try:
+            # Clamp the speed limit to 0-255 and send as a single byte
+            speed_limit_byte = max(0, min(speed_limit, 255))
+            ser.write(bytes([speed_limit_byte]))
+            print("Speed limit sent via TTL:", speed_limit_byte)
+        except Exception as e:
+            print("Error sending speed limit via TTL:", e)
+
+# Main execution
+try:
+    while True:
+        latitude, longitude = get_gps_data()
+        if latitude is not None and longitude is not None:
+            time.sleep(1)  # Respect the rate limit of 1 request per second
+            address_info = reverse_geocode(latitude, longitude)
+            
+            if address_info and 'osm_id' in address_info:
+                osm_id = address_info['osm_id']
+                speed_limit = get_speed_limit(osm_id)
+                if speed_limit is not None:
+                    print(f"Latitude: {latitude}, Longitude: {longitude}, Speed Limit: {speed_limit}")
+                    send_speed_limit_via_ttl(speed_limit)
+                else:
+                    print("Speed limit not found for this location")
+            else:
+                print("OSM ID not found for this location")
+        else:
+            print("Failed to retrieve GPS coordinates")
+except KeyboardInterrupt:
+    print("Program stopped by user.")
+finally:
+    ser.close()  # Ensure to close the serial port on program exit
